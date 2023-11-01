@@ -203,6 +203,143 @@ Go 语言的标准库代码包 sync/atomic 提供了原子的读取（Load 为�
 # goroutine 的自旋占用资源如何解决
 自旋的条件如下：还没自旋超过 4 次,多核处理器， GOMAXPROCS > 1， p 上本地 goroutine 队列为空。
 mutex 会让当前的 goroutine 去空转 CPU，在空转完后再次调用 CAS 方法去尝试性的占有锁资源，直到不满足自旋条件，则最终会加入到等待队列里。
+# 怎么控制并发数？
+有缓冲通道
+根据通道中没有数据时读取操作陷入阻塞和通道已满时继续写入操作陷入阻塞的特性，正好实现控制并发数量。
+三方库实现的协程池
+panjf2000/ants
+Jeffail/tunny
+# 多个 goroutine 对同一个 map 写会 panic，异常是否可以用 defer 捕获？
+可以捕获异常，但是只能捕获一次，Go语言，可以使用多值返回来返回错误。不要用异常代替错误，更不要用来控制流程。在极个别的情况下，才使用Go中引入的Exception处理：defer, panic, recover Go中，对异常处理的原则是：多用error包，少用panic
+# 如何优雅的实现一个 goroutine 池
+https://blog.csdn.net/finghting321/article/details/106492915/
+# GC机制随着golang版本变化如何变化的？
+Go V1.3 之前普通标记清除（mark and sweep）方法，整体过程需要启动 STW，效率极低。
+GoV1.5 三色标记法，堆空间启动写屏障，栈空间不启动，全部扫描之后，需要重新扫描一次栈(需要 STW)，效率普通。
+GoV1.8 三色标记法，混合写屏障机制：栈空间不启动（全部标记成黑色），堆空间启用写屏障，整个过程不要 STW，效率高。
+# 三色标记法的流程？
+程序开始全部白色
+遍历根节点灰色
+遍历灰色，将灰色对象引用的白色对象标为灰色，原来的灰色标为黑色
+堆上并发写，触发屏障 黑色对象引用的白色对象标为灰色，栈上的不变
+循环，直到没有灰色对象
+回收白色前，重新遍历栈空间，加上STW防止外界干扰，（新加的对象直接设置黑色）
+循环，直到没有灰色对象
+停止STW,清除白色对象
+# 插入屏障、删除屏障，混合写屏障（具体的实现比较难描述，但你要知道屏障的作用：避免程序运行过程中，变量被误回收；减少STW的时间）
+插入屏障 黑色对象引用的白色对象设置为灰色
+删除屏障 灰色节点可到达的对象被删除（也是灰色对象），触发删除屏障，导致指向这个对象的指针也会存活，在下一轮GC中被删除
+混写屏障 GC开始栈上全部对象标为黑色 GC期间栈上创建的对象也为黑色 删除的对象标为灰色 添加的对象标为灰色
+# gc中stw的时机是什么，各个阶段都要解决什么？
+解决：减少STW时间，避免内存碎片
+手动调用 runtime.GC()
+内存分配 内存分配到一定阈值自动触发
+定时触发
+标记阶段：并发标记，增量标记
+清理阶段：根对象，写屏障（清理阶段期间，GC 只需要扫描根对象和待清理列表来确定哪些对象需要被释放即可，在这个过程中不需要遍历整个堆。）
+# 什么情况下内存会泄露？怎么定位排查内存泄漏问题？
+goroutine没有关闭，或者一直阻塞，不能GC
+互斥锁没有释放，或者死锁
+time.Ticker 是每隔指定的时间就会向通道内写数据。作为循环触发器，必须调用 stop 方法才会停止，从而被 GC 掉，否则会一直占用内存空间。
+字符串，切片截取
+函数数组传参引发内存泄漏 参数太大
+pprof
+# golang 的内存逃逸吗？什么情况下会发生内存逃逸？
+栈变量跑到了堆上
+内存逃逸的情况如下：
+1）方法内返回局部变量指针。
+2）向 channel 发送指针数据。
+3）在闭包中引用包外的值。
+4）在 slice 或 map 中存储指针。
+5）切片（扩容后）长度太大。
+6）在 interface 类型上调用方法。
+# Go 是如何分配内存的？
+1.Golang程序启动时申请一大块内存，并划分成spans、bitmap、arena区域
+2.arena区域按页划分成一个个小块
+3.span管理一个或多个页
+4.mcentral管理多个span供线程申请使用
+5.mcache作为线程私有资源，资源来源于mcentral
+# Channel 分配在栈上还是堆上？哪些对象分配在堆上，哪些对象分配在栈上？
+堆上
+局部变量分配到栈上，如果编译器不能确定该变量在return后是否还被引用，则分配到堆上，局部变量特别打的话也是在堆上。（逃逸分析）
+# 介绍一下大对象小对象，为什么小对象多了会造成 gc 压力？
+小于等于 32k 的对象就是小对象，其它都是大对象。
+一般小对象通过 mspan 分配内存；大对象则直接由 mheap 分配内存。通常小对象过多会导致 GC 三色法消耗过多的 CPU。优化思路是，减少对象分配。
+
+小对象：如果申请小对象时，发现当前内存空间不存在空闲跨度时，将会需要调用 nextFree 方法获取新的可用的对象，可能会触发 GC 行为。
+
+大对象：如果申请大于 32k 以上的大对象时，可能会触发 GC 行为。
+# Go 多返回值怎么实现的？
+Go 传参和返回值是通过 FP+offset 实现，并且存储在调用函数的栈帧中。FP 栈底寄存器，指向一个函数栈的顶部;PC 程序计数器，指向下一条执行指令;SB 指向静态数据的基指针，全局符号;SP 栈顶寄存器。
+# 讲讲 Go 中主协程如何等待其余协程退出?
+Go 的 sync.WaitGroup 是等待一组协程结束，sync.WaitGroup 只有 3 个方法，Add()是添加计数，Done()减去一个计数，Wait()阻塞直到所有的任务完成。Go 里面还能通过有缓冲的 channel 实现其阻塞等待一组协程结束，这个不能保证一组 goroutine 按照顺序执行，可以并发执行协程。Go 里面能通过无缓冲的 channel 实现其阻塞等待一组协程结束，这个能保证一组 goroutine 按照顺序执行，但是不能并发执行。
+Add()表示协程计数，可以一次Add多个，如Add(3),可以多次Add(1);然后每个子协程必须调用done（）,这样才能保证所有子协程结束，主协程才能结束。
+# Go 语言中不同的类型如何比较是否相等？
+像 string，int，float interface 等可以通过 reflect.DeepEqual 和等于号进行比较，像 slice，struct，map 则一般使用 reflect.DeepEqual 来检测是否相等
+# Go 中 init 函数的特征?
+一个包下可以有多个 init 函数，每个文件也可以有多个 init 函数。多个 init 函数按照它们的文件名顺序逐个初始化。应用初始化时初始化工作的顺序是，从被导入的最深层包开始进行初始化，层层递出最后到 main 包。不管包被导入多少次，包内的 init 函数只会执行一次。应用初始化时初始化工作的顺序是，从被导入的最深层包开始进行初始化，层层递出最后到 main 包。但包级别变量的初始化先于包内 init 函数的执行。
+# Go 中 uintptr 和 unsafe.Pointer 的区别？
+unsafe.Pointer 是通用指针类型，它不能参与计算，任何类型的指针都可以转化成 unsafe.Pointer，unsafe.Pointer 可以转化成任何类型的指针，uintptr 可以转换为 unsafe.Pointer，unsafe.Pointer 可以转换为 uintptr。uintptr 是指针运算的工具，但是它不能持有指针对象（意思就是它跟指针对象不能互相转换），unsafe.Pointer 是指针对象进行运算（也就是 uintptr）的桥梁。
+# golang共享内存（互斥锁）方法实现发送多个get请求
+```go
+package main
+ 
+import (
+    "fmt"
+    "io/ioutil"
+    "net/http"
+	"time"
+	"sync"
+	"runtime"
+)
+ 
+// 计数器
+var counter int = 0
+ 
+func httpget(lock *sync.Mutex){
+	lock.Lock()
+	counter++
+    resp, err := http.Get("http://localhost:8000/rest/api/user")
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
+    defer resp.Body.Close()
+    body, err := ioutil.ReadAll(resp.Body)
+    fmt.Println(string(body))
+    fmt.Println(resp.StatusCode)
+    if resp.StatusCode == 200 {
+        fmt.Println("ok")
+    }
+	lock.Unlock()
+}
+ 
+func main() {
+    start := time.Now()
+	lock := &sync.Mutex{}
+    for i := 0; i < 800; i++ {
+        go httpget(lock)
+    }
+    for  {
+        lock.Lock()
+		c := counter
+		lock.Unlock()
+		runtime.Gosched()
+        if c >= 800 {
+            break
+        }
+    }
+    end := time.Now()
+    consume := end.Sub(start).Seconds()
+    fmt.Println("程序执行耗时(s)：", consume)
+}
+```
+# 从数组中取一个相同大小的slice有成本吗？
+
+
+
+
+
 
 
 
